@@ -140,18 +140,26 @@ shared (initMsg) actor class SwapPool(
     
 
     // --------------------------- limit order ------------------------------------
-    private stable var _isLimitOrderAvailable = false;
+    private stable var _isLimitOrderAvailable = true;
     public shared (msg) func setLimitOrderAvailable(available : Bool) : async () {
         assert(_isAvailable(msg.caller));
         _checkAdminPermission(msg.caller);
+        // If turning off limit orders and they were previously enabled
+        if (not available and _isLimitOrderAvailable) {
+            // Clear the limit order stack
+            _limitOrderStack := List.nil<(Types.LimitOrderType, Types.LimitOrderKey, Types.LimitOrderValue)>();
+            // Clear both RB trees
+            _lowerLimitOrders := RBTree.RBTree<Types.LimitOrderKey, Types.LimitOrderValue>(_limitOrderKeyCompare);
+            _upperLimitOrders := RBTree.RBTree<Types.LimitOrderKey, Types.LimitOrderValue>(_limitOrderKeyCompare);
+        };
         _isLimitOrderAvailable := available;
     };
     public query func getLimitOrderAvailabilityState() : async Result.Result<Bool, Types.Error> { #ok(_isLimitOrderAvailable); };
 
-    private stable var _limitOrderStack : List.List<(Types.LimitOrderKey, Types.LimitOrderValue)> = List.nil<(Types.LimitOrderKey, Types.LimitOrderValue)>();
-    private func _pushLimitOrderStack(limitOrder : (Types.LimitOrderKey, Types.LimitOrderValue)) : () { _limitOrderStack := ?(limitOrder, _limitOrderStack); };
-    private func _popLimitOrderStack() : ?(Types.LimitOrderKey, Types.LimitOrderValue) { switch _limitOrderStack { case null { null }; case (?(h, t)) { _limitOrderStack := t; ?h }; }; };
-    public query func getLimitOrderStack() : async Result.Result<[(Types.LimitOrderKey, Types.LimitOrderValue)], Types.Error> { return #ok(List.toArray(_limitOrderStack)); };
+    private stable var _limitOrderStack : List.List<(Types.LimitOrderType, Types.LimitOrderKey, Types.LimitOrderValue)> = List.nil<(Types.LimitOrderType, Types.LimitOrderKey, Types.LimitOrderValue)>();
+    private func _pushLimitOrderStack(limitOrder : (Types.LimitOrderType, Types.LimitOrderKey, Types.LimitOrderValue)) : () { _limitOrderStack := ?(limitOrder, _limitOrderStack); };
+    private func _popLimitOrderStack() : ?(Types.LimitOrderType, Types.LimitOrderKey, Types.LimitOrderValue) { switch _limitOrderStack { case null { null }; case (?(h, t)) { _limitOrderStack := t; ?h }; }; };
+    public query func getLimitOrderStack() : async Result.Result<[(Types.LimitOrderType, Types.LimitOrderKey, Types.LimitOrderValue)], Types.Error> { return #ok(List.toArray(_limitOrderStack)); };
 
     private func _limitOrderKeyCompare(x : Types.LimitOrderKey, y : Types.LimitOrderKey) : { #less; #equal; #greater } {
         if (x.tickLimit < y.tickLimit) { #less } 
@@ -171,7 +179,7 @@ shared (initMsg) actor class SwapPool(
             for ((key, value) in RBTree.iter(_lowerLimitOrders.share(), #bwd)) {
                 if (_tick <= key.tickLimit) {
                     _lowerLimitOrders.delete({ timestamp = key.timestamp; tickLimit = key.tickLimit; });
-                    _pushLimitOrderStack((key, value));
+                    _pushLimitOrderStack((#Lower, key, value));
                     ignore Timer.setTimer<system>(#nanoseconds (0), _autoDecrease);
                     ignore Timer.setTimer<system>(#nanoseconds (0), _checkLimitOrder);
                     return;
@@ -183,7 +191,7 @@ shared (initMsg) actor class SwapPool(
             for ((key, value) in RBTree.iter(_upperLimitOrders.share(), #fwd)) {
                 if (_tick >= key.tickLimit) {
                     _upperLimitOrders.delete({ timestamp = key.timestamp; tickLimit = key.tickLimit; });
-                    _pushLimitOrderStack((key, value));
+                    _pushLimitOrderStack((#Upper, key, value));
                     ignore Timer.setTimer<system>(#nanoseconds (0), _autoDecrease);
                     ignore Timer.setTimer<system>(#nanoseconds (0), _checkLimitOrder);
                     return;
@@ -193,8 +201,23 @@ shared (initMsg) actor class SwapPool(
     };
     private func _autoDecrease() : async () {
         switch (_popLimitOrderStack()) {
-            case (?(key, value)) {
+            case (?(limitOrderType, key, value)) {
+                // Debug.print("positionId: " # debug_show (value.userPositionId) # ", tickLimit: " # debug_show (key.tickLimit) # ", _tick: " # debug_show (_tick));
                 var userPositionInfo = _positionTickService.getUserPosition(value.userPositionId);
+                switch (limitOrderType) {
+                    case (#Lower) {
+                        if (_tick > key.tickLimit) {
+                            _lowerLimitOrders.put(key, value);
+                            return;
+                        };
+                    };
+                    case (#Upper) {
+                        if (_tick < key.tickLimit) {
+                            _upperLimitOrders.put(key, value);
+                            return; 
+                        };
+                    };
+                };
                 ignore await* _decreaseLiquidity(
                     value.owner, 
                     { isLimitOrder = true; token0InAmount = value.token0InAmount; token1InAmount = value.token1InAmount; tickLimit = key.tickLimit; }, 
@@ -213,6 +236,24 @@ shared (initMsg) actor class SwapPool(
             if (value.userPositionId == userPositionId) { return true; };
         };
         return false;
+    };
+    private func _deleteLimitOrderByPositionId(userPositionId: Nat) : () {
+        // Check and delete from upper limit orders
+        var upperOrdersToKeep = RBTree.RBTree<Types.LimitOrderKey, Types.LimitOrderValue>(_limitOrderKeyCompare);
+        for ((key, value) in RBTree.iter(_upperLimitOrders.share(), #fwd)) {
+            if (value.userPositionId != userPositionId) {
+                upperOrdersToKeep.put(key, value);
+            };
+        };
+        _upperLimitOrders := upperOrdersToKeep;
+        // Check and delete from lower limit orders
+        var lowerOrdersToKeep = RBTree.RBTree<Types.LimitOrderKey, Types.LimitOrderValue>(_limitOrderKeyCompare);
+        for ((key, value) in RBTree.iter(_lowerLimitOrders.share(), #fwd)) {
+            if (value.userPositionId != userPositionId) {
+                lowerOrdersToKeep.put(key, value);
+            };
+        };
+        _lowerLimitOrders := lowerOrdersToKeep;
     };
     public query func getLimitOrders() : async Result.Result<{
         lowerLimitOrders : [(Types.LimitOrderKey, Types.LimitOrderValue)];
@@ -411,6 +452,7 @@ shared (initMsg) actor class SwapPool(
             case (#ok(result)) { result };
             case (#err(code)) { Prim.trap("Decrease liquidity failed: _collect " # debug_show (code)); };
         };
+        if (not loArgs.isLimitOrder) { _deleteLimitOrderByPositionId(args.positionId); };
         if (liquidityDelta == userPositionInfo.liquidity) {
             _positionTickService.deletePositionForUser(PrincipalUtils.toAddress(owner), args.positionId);
         };
@@ -904,8 +946,8 @@ shared (initMsg) actor class SwapPool(
                 };
             });
         };
-        if (not Nat.equal(fee, args.fee)) {
-            return #err(#InternalError("Wrong fee cache, please try later"));
+        if (not Nat.equal(fee, args.fee)) { 
+            return #err(#InternalError("Wrong fee cache (expected: " # debug_show(fee) # ", received: " # debug_show(args.fee) # "), please try later")); 
         };
         if (Text.notEqual(token.standard, "ICP") and Text.notEqual(token.standard, "ICRC1") and Text.notEqual(token.standard, "ICRC2") and Text.notEqual(token.standard, "ICRC3")) {
             return #err(#InternalError("Illegal token standard: " # debug_show (token.standard)));
@@ -970,8 +1012,8 @@ shared (initMsg) actor class SwapPool(
                 };
             });
         };
-        if (not Nat.equal(fee, args.fee)) {
-            return #err(#InternalError("Wrong fee cache, please try later"));
+        if (not Nat.equal(fee, args.fee)) { 
+            return #err(#InternalError("Wrong fee cache (expected: " # debug_show(fee) # ", received: " # debug_show(args.fee) # "), please try later")); 
         };
         var canisterId = Principal.fromActor(this);
         if (Principal.equal(caller, canisterId)) {
@@ -1013,7 +1055,9 @@ shared (initMsg) actor class SwapPool(
         } else {
             (_token1, _token1Act, switch _token1Fee { case (?f) { f }; case (null) { var f = await _token1Act.fee(); _token1Fee := ?(f); f; }; });
         };
-        if (not Nat.equal(fee, args.fee)) { return #err(#InternalError("Wrong fee cache, please try later")); };
+        if (not Nat.equal(fee, args.fee)) { 
+            return #err(#InternalError("Wrong fee cache (expected: " # debug_show(fee) # ", received: " # debug_show(args.fee) # "), please try later")); 
+        };
         var canisterId = Principal.fromActor(this);
         var balance : Nat = _tokenHolderService.getBalance(caller, token);
         if (not (balance > 0)) { return #err(#InsufficientFunds) };
@@ -1054,7 +1098,9 @@ shared (initMsg) actor class SwapPool(
         } else {
             (_token1, _token1Act, switch _token1Fee { case (?f) { f }; case (null) { var f = await _token1Act.fee(); _token1Fee := ?(f); f; }; });
         };
-        if (not Nat.equal(fee, args.fee)) { return #err(#InternalError("Wrong fee cache, please try later")); };
+        if (not Nat.equal(fee, args.fee)) { 
+            return #err(#InternalError("Wrong fee cache (expected: " # debug_show(fee) # ", received: " # debug_show(args.fee) # "), please try later")); 
+        };
         var canisterId = Principal.fromActor(this);
         var balance : Nat = _tokenHolderService.getBalance(caller, token);
         if (not (balance > 0)) { return #err(#InsufficientFunds) };
@@ -1339,36 +1385,25 @@ shared (initMsg) actor class SwapPool(
     public shared (msg) func removeLimitOrder(positionId : Nat) : async Result.Result<Bool, Types.Error> {
         assert(_isAvailable(msg.caller) and _isLimitOrderAvailable);
         if (Principal.isAnonymous(msg.caller)) return #err(#InternalError("Illegal anonymous call"));
-        // Check if position exists
-        let userPosition = _positionTickService.getUserPosition(positionId);
-        if (userPosition.liquidity > 0) {
-            // Position exists, verify caller is owner
-            if (not _positionTickService.checkUserPositionIdByOwner(PrincipalUtils.toAddress(msg.caller), positionId)) {
-                return #err(#InternalError("Caller is not owner"));
-            };
+        if (not _positionTickService.checkUserPositionIdByOwner(PrincipalUtils.toAddress(msg.caller), positionId)) {
+            return #err(#InternalError("Caller is not owner"));
         };
         // Try to remove from both upper and lower order lists
-        var removed = false;
-        label search {
-            // Check upper limit orders
-            for ((key, value) in RBTree.iter(_upperLimitOrders.share(), #fwd)) {
-                if (value.userPositionId == positionId) {
-                    _upperLimitOrders.delete(key);
-                    removed := true;
-                    break search;
-                };
-            };
-            // Check lower limit orders 
-            for ((key, value) in RBTree.iter(_lowerLimitOrders.share(), #fwd)) {
-                if (value.userPositionId == positionId) {
-                    _lowerLimitOrders.delete(key);
-                    removed := true;
-                    break search;
-                };
+        // Check upper limit orders
+        for ((key, value) in RBTree.iter(_upperLimitOrders.share(), #fwd)) {
+            if (value.userPositionId == positionId) {
+                _upperLimitOrders.delete(key);
+                return #ok(true);
             };
         };
-        if (not removed) { return #err(#InternalError("Limit order not found")); };
-        return #ok(true);
+        // Check lower limit orders 
+        for ((key, value) in RBTree.iter(_lowerLimitOrders.share(), #fwd)) {
+            if (value.userPositionId == positionId) {
+                _lowerLimitOrders.delete(key);
+                return #ok(true);
+            };
+        };
+        return #err(#InternalError("Limit order not found"));
     };
 
     public shared (msg) func increaseLiquidity(args : Types.IncreaseLiquidityArgs) : async Result.Result<Nat, Types.Error> {
@@ -1376,6 +1411,10 @@ shared (initMsg) actor class SwapPool(
         // verify msg.caller matches the owner of position
         if (not _positionTickService.checkUserPositionIdByOwner(PrincipalUtils.toAddress(msg.caller), args.positionId)) {
             return #err(#InternalError("Check operator failed"));
+        };
+        // Check if position already has an active order
+        if (_hasActiveLimitOrder(args.positionId)) {
+            return #err(#InternalError("Active limit order can not be increased"));
         };
         var amount0Desired = SafeUint.Uint256(TextUtils.toNat(args.amount0Desired));
         var amount1Desired = SafeUint.Uint256(TextUtils.toNat(args.amount1Desired));
@@ -1444,8 +1483,6 @@ shared (initMsg) actor class SwapPool(
         if (not _positionTickService.checkUserPositionIdByOwner(PrincipalUtils.toAddress(msg.caller), args.positionId)) {
             return #err(#InternalError("Check operator failed"));
         };
-        // let result = _decreaseLiquidity(msg.caller, { isLimitOrder = false; token0InAmount = 0; token1InAmount = 0; tickLimit = 0; }, args);
-        // return result;
         return await* _decreaseLiquidity(msg.caller, { isLimitOrder = false; token0InAmount = 0; token1InAmount = 0; tickLimit = 0; }, args);
     };
 
@@ -1558,6 +1595,10 @@ shared (initMsg) actor class SwapPool(
 
     public shared (msg) func transferPosition(from : Principal, to : Principal, positionId : Nat) : async Result.Result<Bool, Types.Error> {
         assert(_isAvailable(msg.caller));
+        // Check if position already has an active order
+        if (_hasActiveLimitOrder(positionId)) {
+            return #err(#InternalError("Active limit order can not be transferred"));
+        };
         var sender = PrincipalUtils.toAddress(msg.caller);
         var spender = _positionTickService.getAllowancedUserPosition(positionId);
         if ((not Text.equal(sender, spender)) and (not Principal.equal(msg.caller, from))) {
@@ -2186,7 +2227,7 @@ shared (initMsg) actor class SwapPool(
     };
 
     // --------------------------- Version Control ------------------------------------
-    private var _version : Text = "3.5.0";
+    private var _version : Text = "3.5.7";
     public query func getVersion() : async Text { _version };
     // --------------------------- mistransfer recovery ------------------------------------
     public shared({caller}) func getMistransferBalance(token: Types.Token) : async Result.Result<Nat, Types.Error> {
@@ -2236,11 +2277,30 @@ shared (initMsg) actor class SwapPool(
         };
     };
 
+    // --------------------------- ICRC28 ------------------------------------
+    private stable var _icrc28_trusted_origins : [Text] = [
+        "https://standards.identitykit.xyz",
+        "https://dev.standards.identitykit.xyz",
+        "https://demo.identitykit.xyz",
+        "https://dev.demo.identitykit.xyz",
+        "http://localhost:3001",
+        "http://localhost:3002",
+        "https://nfid.one",
+        "https://dev.nfid.one",
+        "https://app.icpswap.com",
+        "https://bplw4-cqaaa-aaaag-qcb7q-cai.icp0.io"
+    ];
+    public shared(msg) func setIcrc28TrustedOrigins(origins: [Text]) : async Result.Result<Bool, ()> {
+        assert(_isAvailable(msg.caller));
+        _checkAdminPermission(msg.caller);
+        _icrc28_trusted_origins := origins;
+        return #ok(true);
+    };
     public func icrc28_trusted_origins() : async ICRCTypes.Icrc28TrustedOriginsResponse {
-        return ICRC21.icrc28_trusted_origins();
+        return {trusted_origins = _icrc28_trusted_origins};
     };
     public query func icrc10_supported_standards() : async [{ url : Text; name : Text }] {
-        ICRC21.icrc10_supported_standards();
+        return ICRC21.icrc10_supported_standards();
     };
     public shared func icrc21_canister_call_consent_message(request : ICRCTypes.Icrc21ConsentMessageRequest) : async ICRCTypes.Icrc21ConsentMessageResponse {
         return ICRC21.icrc21_canister_call_consent_message(request);

@@ -3,6 +3,7 @@ import Iter "mo:base/Iter";
 import Principal "mo:base/Principal";
 import Result "mo:base/Result";
 import Text "mo:base/Text";
+import Cycles "mo:base/ExperimentalCycles";
 import Prim "mo:⛔";
 import Types "./Types";
 
@@ -129,38 +130,22 @@ shared (initMsg) actor class SwapDataBackup(
         //     case (#ok(data)) { data };
         //     case (#err(code)) { return #err(_setBackupError(poolCid, "Get init args failed: " # debug_show(code))); };
         // };
-        // let tickBitmaps = switch (await poolAct.getTickBitmaps()) {
-        //     case (#ok(data)) { data };
-        //     case (#err(code)) { return #err(_setBackupError(poolCid, "Get tick bitmaps failed: " # debug_show(code))); };
-        // };
-        // let feeGrowthGlobal = switch (await poolAct.getFeeGrowthGlobal()) {
-        //     case (#ok(data)) { data };
-        //     case (#err(code)) { return #err(_setBackupError(poolCid, "Get fee growth global failed: " # debug_show(code))); };
-        // };
-        // let limitOrders = switch (await poolAct.getLimitOrders()) {
-        //     case (#ok(data)) { data };
-        //     case (#err(code)) {  return #err(_setBackupError(poolCid, "Get limit orders failed: " # debug_show(code))); };
-        // };
-        // let limitOrderStack = switch (await poolAct.getLimitOrderStack()) {
-        //     case (#ok(data)) { data };
-        //     case (#err(code)) { return #err(_setBackupError(poolCid, "Get limit order stack failed: " # debug_show(code))); };
-        // };
-        // _poolBackupMap.put(poolCid, {
-        //     isDone = true;
-        //     isFailed = false;
-        //     errorMsg = "";
-        //     metadata = metadata;
-        //     allTokenBalances = allTokenBalances;
-        //     positions = positions;
-        //     ticks = ticks;
-        //     tickBitmaps = tickBitmaps;
-        //     tokenAmountState = tokenAmountState;
-        //     userPositions = userPositions;
-        //     userPositionIds = userPositionIds;
-        //     feeGrowthGlobal = feeGrowthGlobal;
-        //     limitOrders = limitOrders;
-        //     limitOrderStack = limitOrderStack;
-        // });
+        let tickBitmaps = switch (await poolAct.getTickBitmaps()) {
+            case (#ok(data)) { data };
+            case (#err(code)) { return #err(_setBackupError(poolCid, "Get tick bitmaps failed: " # debug_show(code))); };
+        };
+        let feeGrowthGlobal = switch (await poolAct.getFeeGrowthGlobal()) {
+            case (#ok(data)) { data };
+            case (#err(code)) { return #err(_setBackupError(poolCid, "Get fee growth global failed: " # debug_show(code))); };
+        };
+        let limitOrders = switch (await poolAct.getLimitOrders()) {
+            case (#ok(data)) { data };
+            case (#err(code)) {  return #err(_setBackupError(poolCid, "Get limit orders failed: " # debug_show(code))); };
+        };
+        let limitOrderStack = switch (await poolAct.getLimitOrderStack()) {
+            case (#ok(data)) { data };
+            case (#err(code)) { return #err(_setBackupError(poolCid, "Get limit order stack failed: " # debug_show(code))); };
+        };
         _poolBackupMap.put(poolCid, {
             isDone = true;
             isFailed = false;
@@ -169,13 +154,13 @@ shared (initMsg) actor class SwapDataBackup(
             allTokenBalances = allTokenBalances;
             positions = positions;
             ticks = ticks;
+            tickBitmaps = tickBitmaps;
             tokenAmountState = tokenAmountState;
             userPositions = userPositions;
             userPositionIds = userPositionIds;
-            tickBitmaps = [];
-            feeGrowthGlobal = { feeGrowthGlobal0X128 = 0; feeGrowthGlobal1X128 = 0; };
-            limitOrders = { lowerLimitOrders = []; upperLimitOrders = []; };
-            limitOrderStack = [];
+            feeGrowthGlobal = feeGrowthGlobal;
+            limitOrders = limitOrders;
+            limitOrderStack = limitOrderStack;
         });
         return #ok();
     };
@@ -211,6 +196,13 @@ shared (initMsg) actor class SwapDataBackup(
         _checkPermission(caller);
         _poolBackupMap := HashMap.HashMap<Principal, PoolBackupData>(0, Principal.equal, Principal.hash);
         #ok();
+    };
+
+    public shared func getCycleInfo() : async Result.Result<Types.CycleInfo, Types.Error> {
+        return #ok({
+            balance = Cycles.balance();
+            available = Cycles.available();
+        });
     };
         
     // public shared (msg) func recoverPool() : async Result.Result<Types.PoolData, Types.Error> {
@@ -298,7 +290,7 @@ shared (initMsg) actor class SwapDataBackup(
     };
 
     // --------------------------- Version Control      -------------------------------
-    private var _version : Text = "3.5.0";
+    private var _version : Text = "3.5.1";
     public query func getVersion() : async Text { _version };
 
     system func preupgrade() {
